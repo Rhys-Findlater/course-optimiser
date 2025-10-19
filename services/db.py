@@ -36,7 +36,7 @@ def _get_pool() -> SimpleConnectionPool:
     # psycopg_pool.ConnectionPool API is similar to what we used before
     return SimpleConnectionPool(
         conninfo=conninfo,
-        min_size=1,
+        min_size=0,
         max_size=10,
         kwargs={"autocommit": True},  # match prior behavior
     )
