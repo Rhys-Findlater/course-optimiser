@@ -9,7 +9,7 @@ import streamlit as st
 
 # --- psycopg v3 replacements (instead of psycopg2) ---
 import psycopg
-from psycopg_pool import ConnectionPool as SimpleConnectionPool  # keep the same name used below
+from psycopg_pool import ConnectionPool as SimpleConnectionPool, PoolClosed
 from psycopg.rows import dict_row
 
 # Cache a single pool across Streamlit reruns.
@@ -40,53 +40,43 @@ def _get_pool() -> SimpleConnectionPool:
         max_size=10,
         kwargs={"autocommit": True},  # match prior behavior
     )
-
-def _ping(conn) -> bool:
-    """
-    Return True if the connection is healthy; False otherwise.
-    """
+    
+def _get_pool_safe() -> SimpleConnectionPool:
+    """Return a live pool; if the cached one was closed, rebuild it."""
     try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT 1;")
-        return True
-    except Exception:
-        return False
+        pool = _get_pool()
+        if getattr(pool, "closed", False):
+            st.cache_resource.clear()
+            pool = _get_pool()
+        return pool
+    except PoolClosed:
+        st.cache_resource.clear()
+        return _get_pool()
 
 @contextmanager
 def get_conn():
-    """
-    Context-managed connection from the pool.
-    Ensures autocommit + read-only (when supported). Recycles broken sockets.
-    """
-    pool = _get_pool()
-
-    # checkout a pooled connection (context-managed)
-    with pool.connection() as conn:
-        # Try to set read-only semantics (ignore if not permitted)
-        try:
-            with conn.cursor() as cur:
-                cur.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY;")
-        except Exception:
-            pass
-
-        # If the socket is stale, reset pool once and retry
-        if not _ping(conn):
+    pool = _get_pool_safe()
+    try:
+        with pool.connection() as conn:
             try:
-                pool.close()
+                with conn.cursor() as cur:
+                    cur.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY;")
             except Exception:
                 pass
-            pool = _get_pool()
-            with pool.connection() as conn2:
-                try:
-                    with conn2.cursor() as cur:
-                        cur.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY;")
-                except Exception:
-                    pass
-                _ = _ping(conn2)
-                yield conn2
-                return
+            yield conn
+            return
+    except (PoolClosed, psycopg.OperationalError, psycopg.InterfaceError):
+        st.cache_resource.clear()
+        pool = _get_pool()
+        with pool.connection() as conn:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY;")
+            except Exception:
+                pass
+            yield conn
+            return
 
-        yield conn
 
 def health_check() -> Tuple[bool, str]:
     """
